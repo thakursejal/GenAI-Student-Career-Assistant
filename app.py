@@ -5,7 +5,9 @@
 
 import json
 import streamlit as st
-from huggingface_hub import InferenceClient
+from pypdf import PdfReader
+from sentence_transformers import SentenceTransformer
+import chromadb
 
 # ============================================================
 # PAGE CONFIGURATION
@@ -27,6 +29,19 @@ MODEL = "openai/gpt-oss-120b:fastest"
 
 client = InferenceClient(
     api_key=HF_TOKEN
+)
+# ============================================================
+# RAG COMPONENTS
+# ============================================================
+
+embedding_model = SentenceTransformer(
+    "all-MiniLM-L6-v2"
+)
+
+chroma_client = chromadb.Client()
+
+pdf_collection = chroma_client.get_or_create_collection(
+    name="uploaded_documents"
 )
 
 # ============================================================
@@ -91,28 +106,141 @@ KNOWLEDGE_BASE = [
         """
     }
 ]
+# ============================================================
+# 📄 PDF DOCUMENT PROCESSING
+# ============================================================
+
+def extract_pdf_text(uploaded_file):
+    """Extract text from an uploaded PDF."""
+
+    reader = PdfReader(uploaded_file)
+
+    pages = []
+
+    for page in reader.pages:
+        text = page.extract_text()
+
+        if text:
+            pages.append(text)
+
+    return "\n".join(pages)
+
+
+def chunk_text(text, chunk_size=800):
+    """Split document text into manageable chunks."""
+
+    words = text.split()
+
+    chunks = []
+
+    for i in range(0, len(words), chunk_size):
+        chunk = " ".join(
+            words[i:i + chunk_size]
+        )
+
+        if chunk.strip():
+            chunks.append(chunk)
+
+    return chunks
+
+
+def process_pdf(uploaded_file):
+    """Extract, chunk, embed and store a PDF."""
+
+    text = extract_pdf_text(uploaded_file)
+
+    if not text.strip():
+        return 0
+
+    chunks = chunk_text(text)
+
+    # Create embeddings
+    embeddings = embedding_model.encode(
+        chunks
+    ).tolist()
+
+    # Create unique IDs for this document
+    document_name = uploaded_file.name
+
+    ids = [
+        f"{document_name}_{i}"
+        for i in range(len(chunks))
+    ]
+
+    # Store in ChromaDB
+    pdf_collection.add(
+        ids=ids,
+        documents=chunks,
+        embeddings=embeddings
+    )
+
+    return len(chunks)
+
+
+def search_pdf_knowledge(query, top_k=3):
+    """Retrieve relevant information from uploaded PDFs."""
+
+    if pdf_collection.count() == 0:
+        return ""
+
+    query_embedding = embedding_model.encode(
+        [query]
+    ).tolist()[0]
+
+    results = pdf_collection.query(
+        query_embeddings=[query_embedding],
+        n_results=min(
+            top_k,
+            pdf_collection.count()
+        )
+    )
+
+    documents = results.get(
+        "documents",
+        [[]]
+    )[0]
+
+    if not documents:
+        return ""
+
+    return "\n\n".join(documents)
 
 # ============================================================
-# SIMPLE KNOWLEDGE RETRIEVAL
+# 🔍 COMBINED KNOWLEDGE SEARCH
 # ============================================================
 
 def search_knowledge(query):
     """
-    Retrieve relevant knowledge based on keywords.
+    Search both the built-in knowledge base
+    and uploaded PDF documents.
     """
 
-    query_words = set(query.lower().split())
+    # --------------------------------------------
+    # Search built-in knowledge
+    # --------------------------------------------
+
+    query_words = set(
+        query.lower().split()
+    )
 
     scored_documents = []
 
     for item in KNOWLEDGE_BASE:
 
-        text_words = set(item["text"].lower().split())
+        text_words = set(
+            item["text"].lower().split()
+        )
 
-        score = len(query_words.intersection(text_words))
+        score = len(
+            query_words.intersection(text_words)
+        )
 
         scored_documents.append(
-            (score, item["topic"], item["text"])
+            (
+                score,
+                item["topic"],
+                item["text"]
+            )
         )
 
     scored_documents.sort(
@@ -120,21 +248,51 @@ def search_knowledge(query):
         reverse=True
     )
 
-    relevant = [
+    built_in_results = [
         item
         for item in scored_documents[:2]
         if item[0] > 0
     ]
 
-    if not relevant:
-        return "No relevant information was found in the knowledge base."
-
-    context = "\n\n".join(
+    built_in_context = "\n\n".join(
         f"[{topic.upper()}]\n{text.strip()}"
-        for _, topic, text in relevant
+        for _, topic, text in built_in_results
     )
 
-    return context
+    # --------------------------------------------
+    # Search uploaded PDF documents
+    # --------------------------------------------
+
+    pdf_context = search_pdf_knowledge(
+        query,
+        top_k=3
+    )
+
+    # --------------------------------------------
+    # Combine results
+    # --------------------------------------------
+
+    contexts = []
+
+    if built_in_context:
+        contexts.append(
+            "BUILT-IN KNOWLEDGE:\n"
+            + built_in_context
+        )
+
+    if pdf_context:
+        contexts.append(
+            "UPLOADED DOCUMENT CONTEXT:\n"
+            + pdf_context
+        )
+
+    if not contexts:
+        return (
+            "No relevant information was found "
+            "in the available knowledge sources."
+        )
+
+    return "\n\n".join(contexts)
 
 
 # ============================================================
@@ -354,6 +512,7 @@ You help users with:
 5. RAG concepts
 6. Task management
 7. Mathematical calculations
+8. Questions about uploaded documents
 
 You are also an AI agent with access to tools.
 
@@ -362,14 +521,19 @@ IMPORTANT RULES:
 - Understand the user's intent before answering.
 - Use tools whenever the request requires an action.
 - Use search_knowledge for study, career, coding, RAG,
-  or GenAI questions when useful.
+  GenAI, or uploaded-document questions when relevant.
 - Use calculator for mathematical calculations.
 - Use task tools when the user asks to add, list, or remove tasks.
 - Never claim an action was completed unless the tool executed successfully.
 - If multiple actions are requested, complete all required actions.
-- Give clear and practical answers.
-- Use headings and bullet points when useful.
-- Do not invent information.
+- When search_knowledge returns information from an uploaded document,
+  use that retrieved context to answer the user's question.
+- Treat retrieved document context as the primary source for
+  document-specific questions.
+- Do not invent information that is not supported by the retrieved context.
+- If the retrieved context does not contain enough information,
+  clearly tell the user that the information was not found.
+- Give clear, practical, and structured answers.
 """
 
 
@@ -488,6 +652,57 @@ This application combines:
 **🧠 LLM + ✨ Prompt Engineering + 📚 RAG + 🛠️ Tools + 🤖 AI Agents**
 """
 )
+# ============================================================
+# 📄 PDF UPLOAD & DOCUMENT RAG
+# ============================================================
+
+st.subheader("📄 Chat With Your Documents")
+
+st.write(
+    "Upload a PDF and the AI Agent will extract, process, "
+    "and retrieve relevant information from it."
+)
+
+uploaded_pdf = st.file_uploader(
+    "Upload a PDF document",
+    type=["pdf"],
+    help="Upload a PDF to add its content to the RAG knowledge base."
+)
+
+if uploaded_pdf is not None:
+
+    if st.button("📚 Process PDF"):
+
+        with st.spinner(
+            "📄 Processing your document..."
+        ):
+
+            try:
+
+                chunk_count = process_pdf(
+                    uploaded_pdf
+                )
+
+                if chunk_count > 0:
+
+                    st.success(
+                        f"✅ PDF processed successfully! "
+                        f"{chunk_count} text chunks added to the knowledge base."
+                    )
+
+                    st.session_state.pdf_processed = True
+
+                else:
+
+                    st.warning(
+                        "⚠️ No readable text was found in the PDF."
+                    )
+
+            except Exception as e:
+
+                st.error(
+                    f"❌ Unable to process the PDF: {e}"
+                )
 
 # ============================================================
 # SIDEBAR
