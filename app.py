@@ -8,6 +8,7 @@ import streamlit as st
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 import chromadb
+from huggingface_hub import InferenceClient
 
 # ============================================================
 # PAGE CONFIGURATION
