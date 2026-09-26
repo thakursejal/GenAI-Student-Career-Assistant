@@ -1,2 +1,5 @@
 streamlit
 huggingface_hub
+pypdf
+sentence-transformers
+chromadb
